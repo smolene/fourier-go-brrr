@@ -1,15 +1,17 @@
 #![allow(dead_code, unused_variables)]
-
 use std::cmp::Ordering;
 use std::io::BufRead;
-use std::{io::stdin};
+use std::io::stdin;
 use std::sync::mpsc;
 use rustfft::num_complex::Complex32;
 use sdl2::audio::{AudioSpecDesired, AudioCallback, AudioSpec};
+use note::Note;
+
+mod note;
 
 const SAMPLE_SIZE: usize = 4096;
 const RATIO_SHOWN: usize = 32;
-const DISP_NUM: usize = 4096/64;
+const DISP_NUM: usize = 64;
 const COMMA: f64 = 1.0594630943592953;
 static NOTES: &'static [(f64, &'static str)] = &[
     (220.0, "La"),
@@ -43,20 +45,23 @@ fn main() {
         &spec, 
         |spec| {
             println!("Using config: {:?}", &spec);
-            Note { 
+            Samples { 
                 spec, 
                 tx,
-                fft: rustfft::FftPlanner::<f32>::new(),
             }
         },
     ).unwrap();
     cap.resume();
 
     let t = std::thread::spawn(move || {
+        let mut fft_planer = rustfft::FftPlanner::<f32>::new();
         loop { 
-            let msg = rx.recv().unwrap();
+            let mut msg = rx.recv().unwrap();
+            let fft = fft_planer.plan_fft_forward(msg.freq.len());
+            fft.process(&mut msg.freq);
             soundboard(&msg);
-            display_note(&msg);
+            let hz = strongest_hz(&msg);
+            println!("{:>5} {:>4}", hz, Note::hz_to_str(hz));
         }
     });
 
@@ -65,10 +70,9 @@ fn main() {
     stdin.lock().read_line(&mut s).unwrap();
 }
 
-struct Note {
+struct Samples {
     spec: AudioSpec,
     tx: mpsc::Sender<Msg>,
-    fft: rustfft::FftPlanner<f32>,
 }
 
 #[derive(Debug)]
@@ -77,14 +81,11 @@ struct Msg {
     samples_per_second: i32,
 }
 
-impl AudioCallback for Note {
+impl AudioCallback for Samples {
     type Channel = f32;
 
     fn callback(&mut self, samples: &mut [Self::Channel]) {
-        let fft = self.fft.plan_fft_forward(samples.len());
-        let mut buf: Vec<Complex32> = samples.iter().map(|&f| Complex32::new(f, 0.0)).collect();
-        fft.process(&mut buf);
-
+        let buf: Vec<Complex32> = samples.iter().map(|&f| Complex32::new(f, 0.0)).collect();
         let _osef = self.tx.send(Msg { freq: buf, samples_per_second: self.spec.freq });
     }
 }
@@ -106,28 +107,12 @@ fn compute_frequency(bin_index: usize, samples_per_second: usize, sample_count: 
     bin_index as f64 * samples_per_second as f64 / sample_count as f64 // lol rip accuracy
 }
 
-fn hz_to_note(mut hz: f64) -> &'static str {
-    let mut iters = 0;
-    while hz > 440.0 && iters < 100 { hz /= 2.0; iters += 1; }
-    while hz < 220.0 && iters < 100 { hz *= 2.0; iters += 1; }
-    if iters >= 100 { return "?" }
-
-    let idx = NOTES.partition_point(|(x, _)| *x < hz);
-    let dd = (hz - NOTES.get(idx - 1).map(|x| x.0).unwrap_or(100000.0)).abs();
-    let du = (hz - NOTES.get(idx    ).map(|x| x.0).unwrap_or(100000.0)).abs();
-    if dd < du {
-        NOTES[idx - 1].1
-    } else {
-        NOTES[idx].1
-    }
-}
-
 fn soundboard(msg: &Msg) {
     use std::fmt::Write;
 
     // The low frequencies are very present because i don't do windowing to clean up the signal.
     let mut s = String::new();
-    let mut freqs = msg.freq[0..SAMPLE_SIZE / RATIO_SHOWN].to_vec(); //&msg.freq[0..msg.freq.len() / 2];
+    let mut freqs = msg.freq[0..SAMPLE_SIZE / RATIO_SHOWN].to_vec();
     let sample_count = msg.freq.len();
     let freq_num = freqs.len();
     normalize_freqs(&mut freqs);
@@ -136,9 +121,9 @@ fn soundboard(msg: &Msg) {
     for (i, c) in freqs.chunks(chunk_size).enumerate() {
         s.clear();
         let hz = compute_frequency(i * chunk_size, msg.samples_per_second as usize, sample_count);
-        write!(s, "{:>5.0} {:>4}: ", hz, hz_to_note(hz)).unwrap();
+        write!(s, "{:>5.0} {:>4}: ", hz, Note::hz_to_str(hz)).unwrap();
         let avg: f32 = c.iter().map(|x| x.norm()).sum::<f32>() / c.len() as f32;
-        for _ in 0..(avg * 40.0).round() as i32 {
+        for _ in 0..(avg * 60.0).round() as i32 {
             s.push('|');
         }
         println!("{}", &s);
@@ -146,8 +131,8 @@ fn soundboard(msg: &Msg) {
     println!();
 }
 
-fn display_note(msg: &Msg) {
-    // beware! if you take freq[n..] where n > 0 all indicies are offset!
+fn strongest_hz(msg: &Msg) -> f64 {
+    // beware! if you take freq[n..] where n > 0 all indices are offset!
     let interesting = &msg.freq[0..SAMPLE_SIZE/RATIO_SHOWN];
     let max_idx = interesting.iter()
         .enumerate()
@@ -155,6 +140,5 @@ fn display_note(msg: &Msg) {
             let norm = x.norm_sqr(); 
             if norm > maxx { (i, norm) } else { (maxi, maxx) }
     });
-    let hz = compute_frequency(max_idx.0, msg.samples_per_second as usize, msg.freq.len());
-    println!("{:>5} {:>4}", hz, hz_to_note(hz));
+    compute_frequency(max_idx.0, msg.samples_per_second as usize, msg.freq.len())
 }
